@@ -1,0 +1,789 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Spiderbench Lite</title>
+<link rel="icon" href="data:," />
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#000;font-family:system-ui,sans-serif;color:#fff}
+canvas{display:block;width:100vw;height:100vh}
+#hud{position:fixed;top:10px;left:12px;font:600 14px/1.5 monospace;text-shadow:0 1px 2px #000;pointer-events:none;white-space:pre}
+#hp{position:fixed;left:12px;bottom:14px;width:260px;height:10px;background:#0008;border:1px solid #fff5;pointer-events:none}
+#hp i{display:block;height:100%;width:100%;background:linear-gradient(90deg,#9e1017,#e3262f)}
+#feed{position:fixed;right:12px;top:10px;text-align:right;font:600 13px/1.6 system-ui;text-shadow:0 1px 2px #000;pointer-events:none}
+#cross{position:fixed;left:50%;top:50%;width:6px;height:6px;margin:-3px;border-radius:50%;background:#fff8;pointer-events:none}
+#menu{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#000b;text-align:center;font:15px/1.7 system-ui}
+#menu>div>b{font-size:38px;color:#e3262f;letter-spacing:.04em}
+#menu input{font:600 18px system-ui;padding:8px 12px;border-radius:6px;border:0;width:220px;text-align:center}
+#menu button{font:700 18px system-ui;padding:9px 22px;border-radius:6px;border:0;background:#e3262f;color:#fff;cursor:pointer;margin-left:6px}
+#menu button:disabled{background:#555;cursor:wait}
+#menu table{margin:14px auto 0;border-collapse:collapse;font-size:14px;text-align:left}
+#menu td{padding:1px 10px}#menu td:first-child{color:#ffb3b6;font-weight:700;text-align:right}
+</style>
+<script type="importmap">{"imports":{"three":"./three.module.min.js"}}</script>
+</head>
+<body>
+<div id="hud"></div>
+<div id="hp"><i></i></div>
+<div id="feed"></div>
+<div id="cross"></div>
+<div id="menu"><div>
+  <b>SPIDERBENCH</b><br>
+  <span id="status">Carregando...</span><br><br>
+  <form id="join"><input id="name" maxlength="20" placeholder="Seu nome" autocomplete="off" /><button id="go" disabled>Entrar</button></form>
+  <table>
+    <tr><td>Mouse</td><td>câmera</td></tr>
+    <tr><td>WASD</td><td>andar · <b>Shift</b> correr</td></tr>
+    <tr><td>Espaço</td><td>pular (segure para pulo alto) · na parede: salto · na teia: soltar com impulso</td></tr>
+    <tr><td>Botão direito</td><td>segurar: balançar na teia</td></tr>
+    <tr><td>E / botão do meio</td><td>puxar teia até o ponto mirado (tirolesa)</td></tr>
+    <tr><td>Botão esquerdo / F</td><td>atacar (combo, avança até o alvo)</td></tr>
+    <tr><td>Q</td><td>esquivar</td></tr>
+    <tr><td>C / Ctrl</td><td>soltar a teia e mergulhar</td></tr>
+    <tr><td>Parede</td><td>encoste para grudar · W sobe · S desce</td></tr>
+    <tr><td>T</td><td>teleportar até outro jogador</td></tr>
+    <tr><td>Esc</td><td>pausar</td></tr>
+  </table>
+</div></div>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from './jsm/loaders/GLTFLoader.js';
+import * as SkeletonUtils from './jsm/utils/SkeletonUtils.js';
+
+const A = '../assets/';
+
+// ---------- renderer: always 800x600, stretched to the window ----------
+const W = 800, H = 600;
+const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance', stencil: false });
+renderer.setPixelRatio(1);
+renderer.setSize(W, H, false);
+document.body.prepend(renderer.domElement);
+const ANISO = Math.min(4, renderer.capabilities.getMaxAnisotropy());
+
+const scene = new THREE.Scene();
+const SKY = 0xa9c9e6;
+scene.background = new THREE.Color(SKY);
+scene.fog = new THREE.Fog(SKY, 140, 450);
+const camera = new THREE.PerspectiveCamera(65, innerWidth / innerHeight, 0.3, 500);
+addEventListener('resize', () => { camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); });
+
+scene.add(new THREE.HemisphereLight(0xe4f0ff, 0x4a4a40, 1.5));
+const sun = new THREE.DirectionalLight(0xfff1dc, 1.6);
+sun.position.set(0.5, 1, 0.3);
+scene.add(sun);
+
+const manager = new THREE.LoadingManager();
+const texLoader = new THREE.TextureLoader(manager);
+function tex(path, rx = 1, ry = rx) {
+  const t = texLoader.load(A + path);
+  t.colorSpace = THREE.SRGBColorSpace; t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(rx, ry); t.anisotropy = ANISO; return t;
+}
+
+// ---------- facade textures (drawn once, tiled on every wall) ----------
+// one tile = 2 bays x 2 floors = 8 m x 7 m
+let seed = 7;
+const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;   // same city on every computer
+function facade(wall, glassA, glassB, frame, tall) {
+  const c = document.createElement('canvas'); c.width = c.height = 256;
+  const g = c.getContext('2d');
+  g.fillStyle = wall; g.fillRect(0, 0, 256, 256);
+  for (let i = 0; i < 400; i++) { g.fillStyle = `rgba(0,0,0,${Math.random() * 0.05})`; g.fillRect(Math.random() * 256, Math.random() * 256, 3, 3); }
+  for (let bx = 0; bx < 2; bx++) for (let fy = 0; fy < 2; fy++) {
+    const x = bx * 128 + 22, y = fy * 128 + (tall ? 14 : 26), w = 84, h = tall ? 100 : 76;
+    g.fillStyle = frame; g.fillRect(x - 4, y - 4, w + 8, h + 8);
+    const gr = g.createLinearGradient(x, y, x + w, y + h);
+    const lit = Math.random() < 0.3;
+    gr.addColorStop(0, lit ? '#e8d7a8' : glassA); gr.addColorStop(1, lit ? '#b89c62' : glassB);
+    g.fillStyle = gr; g.fillRect(x, y, w, h);
+    g.fillStyle = frame; g.fillRect(x + w / 2 - 2, y, 4, h);
+    g.fillStyle = 'rgba(0,0,0,.25)'; g.fillRect(x - 6, y + h + 4, w + 12, 5);
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace; t.wrapS = t.wrapT = THREE.RepeatWrapping; t.anisotropy = ANISO;
+  return t;
+}
+const facades = [
+  facade('#b7ad9e', '#2b3a4a', '#6f8598', '#e0dbd2', false),
+  facade('#8e5a45', '#23303c', '#586b7c', '#d8cfc0', false),
+  facade('#9aa3ad', '#1d2a38', '#7d9ab3', '#4c535b', true),
+  facade('#c9c2b4', '#34414e', '#8093a4', '#8a8478', false),
+];
+
+// ---------- city ----------
+const CELL = 40, FOOT = 24, WALK = 30, N = 22, HALF = N * CELL / 2;
+const buildings = [], parks = [];
+const grid = new Array(N * N).fill(null);
+for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
+  const cx = -HALF + i * CELL + CELL / 2, cz = -HALF + j * CELL + CELL / 2;
+  if (rnd() < 0.08) { parks.push([cx, cz]); continue; }
+  const d = Math.hypot(cx, cz) / HALF;
+  const h = Math.round((12 + rnd() * (d < 0.4 ? 130 : 60)) / 3.5) * 3.5 + 1;
+  const b = { x0: cx - FOOT / 2, x1: cx + FOOT / 2, z0: cz - FOOT / 2, z1: cz + FOOT / 2, h, style: Math.floor(rnd() * facades.length) };
+  buildings.push(b); grid[i * N + j] = b;
+}
+{
+  // walls: one merged mesh per facade style, UVs in metres so windows keep their size
+  const walls = facades.map(() => ({ p: [], u: [], c: [] }));
+  const roof = { p: [], u: [] };
+  const col = new THREE.Color();
+  for (const b of buildings) {
+    const w = walls[b.style];
+    col.setScalar(0.85 + rnd() * 0.25);
+    const quad = (ax, az, bx, bz) => {
+      const len = Math.hypot(bx - ax, bz - az), uL = len / 8, vH = b.h / 7;
+      w.p.push(ax, 0, az, bx, 0, bz, bx, b.h, bz, ax, 0, az, bx, b.h, bz, ax, b.h, az);
+      w.u.push(0, 0, uL, 0, uL, vH, 0, 0, uL, vH, 0, vH);
+      for (let k = 0; k < 6; k++) w.c.push(col.r, col.g, col.b);
+    };
+    quad(b.x0, b.z1, b.x1, b.z1); quad(b.x1, b.z1, b.x1, b.z0);
+    quad(b.x1, b.z0, b.x0, b.z0); quad(b.x0, b.z0, b.x0, b.z1);
+    const h = b.h, s = 1 / 6;
+    roof.p.push(b.x0, h, b.z0, b.x0, h, b.z1, b.x1, h, b.z1, b.x0, h, b.z0, b.x1, h, b.z1, b.x1, h, b.z0);
+    roof.u.push(b.x0 * s, b.z0 * s, b.x0 * s, b.z1 * s, b.x1 * s, b.z1 * s, b.x0 * s, b.z0 * s, b.x1 * s, b.z1 * s, b.x1 * s, b.z0 * s);
+  }
+  const mk = (p, u, c) => {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(p, 3));
+    g.setAttribute('uv', new THREE.Float32BufferAttribute(u, 2));
+    if (c) g.setAttribute('color', new THREE.Float32BufferAttribute(c, 3));
+    g.computeVertexNormals(); return g;
+  };
+  walls.forEach((w, k) => scene.add(new THREE.Mesh(mk(w.p, w.u, w.c), new THREE.MeshLambertMaterial({ map: facades[k], vertexColors: true }))));
+  scene.add(new THREE.Mesh(mk(roof.p, roof.u), new THREE.MeshLambertMaterial({ map: tex('city/tex/sidewalk_col.png'), color: 0x9a948a })));
+
+  // sidewalks around each block, grass in the empty lots
+  const slab = new THREE.BoxGeometry(WALK, 0.15, WALK); slab.translate(0, 0.075, 0);
+  const walk = new THREE.InstancedMesh(slab, new THREE.MeshLambertMaterial({ map: tex('city/tex/sidewalk_col.png', 8) }), buildings.length);
+  const m = new THREE.Matrix4();
+  buildings.forEach((b, k) => { walk.setMatrixAt(k, m.makeTranslation((b.x0 + b.x1) / 2, 0, (b.z0 + b.z1) / 2)); });
+  scene.add(walk);
+  const grass = new THREE.InstancedMesh(slab, new THREE.MeshLambertMaterial({ map: tex('city/tex/grass_col.png', 6) }), parks.length);
+  parks.forEach(([x, z], k) => grass.setMatrixAt(k, m.makeTranslation(x, 0, z)));
+  scene.add(grass);
+
+  const S = HALF * 2 + 400;
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(S, S), new THREE.MeshLambertMaterial({ map: tex('city/tex/asphalt_col.png', S / 5) }));
+  ground.rotation.x = -Math.PI / 2; scene.add(ground);
+}
+function nearBuildings(x, z) {
+  const i = Math.floor((x + HALF) / CELL), j = Math.floor((z + HALF) / CELL), out = [];
+  for (let a = i - 1; a <= i + 1; a++) for (let b = j - 1; b <= j + 1; b++)
+    if (a >= 0 && b >= 0 && a < N && b < N && grid[a * N + b]) out.push(grid[a * N + b]);
+  return out;
+}
+const blocked = (x, z, pad) => nearBuildings(x, z).some(b => x > b.x0 - pad && x < b.x1 + pad && z > b.z0 - pad && z < b.z1 + pad);
+// local randomness (thug spots etc.) must not disturb the shared city seed
+const lr = Math.random;
+function streetSpot() {
+  for (;;) {
+    const x = (lr() * 2 - 1) * HALF * 0.9, z = (lr() * 2 - 1) * HALF * 0.9;
+    if (!blocked(x, z, 4)) return new THREE.Vector3(x, 0, z);
+  }
+}
+// ray vs building boxes (for the zip)
+function raycastCity(o, d, maxD) {
+  let best = null, bt = maxD;
+  const tmp = new THREE.Vector3();
+  for (let s = 0; s < maxD; s += CELL / 2) {
+    tmp.copy(o).addScaledVector(d, s);
+    for (const b of nearBuildings(tmp.x, tmp.z)) {
+      let t0 = 0, t1 = bt, ok = true;
+      for (const [oa, da, lo, hi] of [[o.x, d.x, b.x0, b.x1], [o.y, d.y, 0, b.h], [o.z, d.z, b.z0, b.z1]]) {
+        if (Math.abs(da) < 1e-6) { if (oa < lo || oa > hi) { ok = false; break; } continue; }
+        let ta = (lo - oa) / da, tb = (hi - oa) / da; if (ta > tb) [ta, tb] = [tb, ta];
+        t0 = Math.max(t0, ta); t1 = Math.min(t1, tb); if (t0 > t1) { ok = false; break; }
+      }
+      if (ok && t0 < bt) { bt = t0; best = b; }
+    }
+    if (best) break;
+  }
+  return best ? { b: best, point: o.clone().addScaledVector(d, bt) } : null;
+}
+
+// ---------- characters ----------
+const gltf = new GLTFLoader(manager);
+const toLambert = root => root.traverse(o => {
+  if (!o.isMesh) return;
+  o.frustumCulled = false;
+  const src = o.material;
+  o.material = new THREE.MeshLambertMaterial({ map: src.map || null, color: src.map ? 0xffffff : src.color, side: src.side, transparent: src.transparent, opacity: src.opacity });
+});
+const fitHeight = (root, h) => { const box = new THREE.Box3().setFromObject(root); root.scale.multiplyScalar(h / Math.max(0.01, box.max.y - box.min.y)); };
+// keep the animation in place: the hips may move up/down, never across the ground
+function inPlace(clips) {
+  for (const c of clips) for (const t of c.tracks) {
+    if (!/hips\.position$/.test(t.name)) continue;
+    const v = t.values, x0 = v[0], z0 = v[2];
+    for (let i = 0; i < v.length; i += 3) { v[i] = x0; v[i + 2] = z0; }
+  }
+  return clips;
+}
+function animator(root, clips) {
+  const mixer = new THREE.AnimationMixer(root), map = {};
+  for (const c of clips) map[c.name] = c;
+  let cur = null, curName = '';
+  return {
+    mixer, has: n => !!map[n],
+    play(name, { once = false, fade = 0.15, speed = 1 } = {}) {
+      if (!map[name]) return;
+      if (name === curName && !once) return;
+      const a = mixer.clipAction(map[name]);
+      a.reset(); a.setLoop(once ? THREE.LoopOnce : THREE.LoopRepeat); a.clampWhenFinished = once; a.timeScale = speed;
+      if (cur && cur !== a) a.crossFadeFrom(cur, fade, false);
+      a.play(); cur = a; curName = name;
+    },
+    get name() { return curName; },
+  };
+}
+const SUITS = [0xffffff, 0x6fa8ff, 0x7dff8a, 0xffe066, 0xc58bff, 0xff9a5a, 0x5affea, 0x888888];
+
+const player = new THREE.Group(); scene.add(player);
+let pAnim = null, spiderSrc = null, spiderClips = [], handR = null;
+const thugs = [];
+Promise.all([gltf.loadAsync(A + 'spiderman.glb'), gltf.loadAsync(A + 'thug.glb')]).then(([sp, th]) => {
+  toLambert(sp.scene); fitHeight(sp.scene, 1.8);
+  spiderSrc = sp.scene; spiderClips = inPlace(sp.animations);
+  const me = SkeletonUtils.clone(spiderSrc); player.add(me);
+  handR = me.getObjectByName('hand.R');
+  pAnim = animator(me, spiderClips); pAnim.play('idle');
+
+  // thugs share the rig, so they can borrow the hero's walk/jog
+  toLambert(th.scene); fitHeight(th.scene, 1.8);
+  const clips = inPlace(th.animations).concat(spiderClips.filter(c => ['walk', 'jog'].includes(c.name)));
+  for (let k = 0; k < 18; k++) {
+    const m = SkeletonUtils.clone(th.scene); scene.add(m);
+    const an = animator(m, clips); an.mixer.setTime(lr() * 3); an.play('thugIdle');
+    const t = { m, an, v: new THREE.Vector3(), hp: 3, down: 0, stun: 0, atk: 0, cd: lr() * 2, home: null };
+    placeThug(t); thugs.push(t);
+  }
+  for (const r of remotes.values()) buildRemote(r);
+}).catch(e => { console.error(e); status.textContent = 'Erro ao carregar modelos: ' + e.message; });
+function placeThug(t) {
+  t.home = streetSpot(); t.m.position.copy(t.home); t.m.rotation.set(0, lr() * 6.28, 0);
+  t.hp = 3; t.down = 0; t.stun = 0; t.atk = 0; t.v.set(0, 0, 0);
+}
+
+// ---------- traffic (parked, one instanced mesh per model) ----------
+gltf.load(A + 'city/vehicles.glb', g => {
+  g.scene.updateMatrixWorld(true);
+  const models = [];
+  g.scene.traverse(o => { if (o.isMesh && (/_l1$/.test(o.name) || /_l1$/.test(o.parent?.name || ''))) models.push(o); });
+  if (!models.length) g.scene.traverse(o => { if (o.isMesh && !/_l\d$/.test(o.name)) models.push(o); });
+  const per = Math.max(4, Math.floor(180 / Math.max(1, models.length)));
+  const m = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new THREE.Vector3(1, 1, 1), p = new THREE.Vector3(), up = new THREE.Vector3(0, 1, 0);
+  for (const o of models) {
+    const geo = o.geometry.clone(); geo.applyMatrix4(o.matrixWorld);
+    geo.computeBoundingBox(); const bb = geo.boundingBox;
+    geo.translate(-(bb.min.x + bb.max.x) / 2, -bb.min.y, -(bb.min.z + bb.max.z) / 2);
+    const long = (bb.max.x - bb.min.x) > (bb.max.z - bb.min.z);
+    const mat = new THREE.MeshLambertMaterial({ vertexColors: !!geo.attributes.color, color: geo.attributes.color ? 0xffffff : 0x8899aa });
+    const inst = new THREE.InstancedMesh(geo, mat, per);
+    for (let k = 0; k < per; k++) {
+      const alongX = rnd() < 0.5, line = Math.floor(rnd() * (N + 1)), side = rnd() < 0.5 ? -1 : 1;
+      const c = -HALF + line * CELL + side * 3, t = (rnd() * 2 - 1) * HALF;
+      p.set(alongX ? t : c, 0, alongX ? c : t);
+      let ang = (alongX ? Math.PI / 2 : 0) + (side > 0 ? Math.PI : 0);
+      if (long) ang += Math.PI / 2;
+      q.setFromAxisAngle(up, ang);
+      inst.setMatrixAt(k, m.compose(p, q, s));
+    }
+    scene.add(inst);
+  }
+});
+
+// ---------- player state ----------
+const pos = new THREE.Vector3(), vel = new THREE.Vector3();
+function spawnPoint() {
+  const b = buildings[Math.floor(lr() * buildings.length)];
+  return new THREE.Vector3((b.x0 + b.x1) / 2, b.h, (b.z0 + b.z1) / 2);
+}
+pos.copy(spawnPoint());
+let onGround = true, wall = null, anchor = null, ropeLen = 0, zip = null, yaw = 0, pitch = 0.25, score = 0, airT = 0;
+let hp = 100, hurtT = 0, invuln = 0, downT = 0, dodgeT = 0, jumpCharge = 0, lunge = null;
+let tpIdx = -1, combo = 0, comboT = 0, atkT = 0, oneShot = null, oneShotT = 0;
+const R = 0.5;
+
+function makeWeb() {
+  const l = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]), new THREE.LineBasicMaterial({ color: 0xffffff }));
+  l.frustumCulled = false; l.visible = false; scene.add(l); return l;
+}
+const web = makeWeb();
+function setWeb(line, from, to) {
+  line.visible = !!to; if (!to) return;
+  const p = line.geometry.attributes.position; p.setXYZ(0, from.x, from.y, from.z); p.setXYZ(1, to.x, to.y, to.z); p.needsUpdate = true;
+}
+
+// ---------- input (same layout as the original game) ----------
+const BOT = new URLSearchParams(location.search).has('bot');
+const keys = {}, pressed = {}; let mouse = 0, locked = false, ready = false, joined = false;
+const menu = document.getElementById('menu'), hud = document.getElementById('hud'), status = document.getElementById('status');
+const hpBar = document.querySelector('#hp i'), feed = document.getElementById('feed'), nameIn = document.getElementById('name'), goBtn = document.getElementById('go');
+try { nameIn.value = localStorage.getItem('spiderbench.name') || ''; } catch {}
+manager.onProgress = (u, a, b) => { if (!ready) status.textContent = `Carregando... ${a}/${b}`; };
+manager.onLoad = () => {
+  if (ready) return;
+  ready = true; goBtn.disabled = false; status.textContent = 'Escolha um nome e entre no mundo';
+  if (BOT) {   // ?bot : plays by itself (for testing without a person at the keyboard)
+    joined = true; menu.style.display = 'none'; net.connect('Bot ' + Math.floor(lr() * 100));
+    keys.KeyW = true; keys.ShiftLeft = true;
+    setInterval(() => { mouse ^= 4; yaw += 0.6; pressed.M0 = true; if (lr() < 0.3) pressed.KeyE = true; if (lr() < 0.3) pressed.Space = true; }, 1500);
+  }
+};
+manager.onError = u => console.warn('falhou:', u);
+setTimeout(() => manager.onLoad(), 25000);   // a slow texture never blocks joining; it pops in when it arrives
+document.getElementById('join').addEventListener('submit', e => {
+  e.preventDefault(); if (!ready) return;
+  const name = nameIn.value.trim().slice(0, 20) || 'Aranha';
+  try { localStorage.setItem('spiderbench.name', name); } catch {}
+  if (!joined) { joined = true; nameIn.disabled = true; net.connect(name); }
+  renderer.domElement.requestPointerLock();
+});
+renderer.domElement.addEventListener('click', () => { if (!locked && joined) renderer.domElement.requestPointerLock(); });
+document.addEventListener('pointerlockchange', () => {
+  locked = document.pointerLockElement === renderer.domElement;
+  menu.style.display = locked ? 'none' : 'flex';
+  if (joined) { status.textContent = 'Pausado'; goBtn.textContent = 'Voltar'; }
+  if (!locked) { mouse = 0; for (const k in keys) keys[k] = false; }
+});
+addEventListener('keydown', e => {
+  if (document.activeElement === nameIn) return;
+  if (!keys[e.code]) pressed[e.code] = true; keys[e.code] = true;
+  if (['Space', 'Tab'].includes(e.code)) e.preventDefault();
+});
+addEventListener('keyup', e => { keys[e.code] = false; });
+addEventListener('mousemove', e => { if (!locked) return; yaw -= e.movementX * 0.0025; pitch = Math.max(-0.6, Math.min(1.2, pitch + e.movementY * 0.0025)); });
+addEventListener('mousedown', e => { if (!locked) return; mouse |= 1 << e.button; pressed['M' + e.button] = true; if (e.button === 1) e.preventDefault(); });
+addEventListener('mouseup', e => { mouse &= ~(1 << e.button); });
+addEventListener('contextmenu', e => e.preventDefault());
+const took = k => { const v = pressed[k]; pressed[k] = false; return v; };
+
+function say(text) {
+  const d = document.createElement('div'); d.textContent = text; feed.prepend(d);
+  setTimeout(() => d.remove(), 5000); while (feed.children.length > 6) feed.lastChild.remove();
+}
+function playOnce(name, t, opts) { if (!pAnim?.has(name)) return; oneShot = name; oneShotT = t; pAnim.play(name, { once: true, fade: 0.08, ...opts }); }
+
+// ---------- combat ----------
+function targets() {
+  const out = [];
+  for (const t of thugs) if (t.down <= 0) out.push({ kind: 'thug', t, p: t.m.position });
+  for (const r of remotes.values()) if (r.obj && !r.down) out.push({ kind: 'player', r, p: r.obj.position });
+  return out;
+}
+function attack() {
+  if (atkT > 0 || downT > 0 || zip) return;
+  combo = comboT > 0 ? combo + 1 : 0; comboT = 0.9; atkT = 0.32;
+  const fwd = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
+  let best = null, bs = Infinity;
+  for (const tg of targets()) {
+    const d = tg.p.clone().sub(pos); if (Math.abs(d.y) > 4) continue;
+    const dist = d.length(); if (dist > 10) continue;
+    const s = dist - d.setY(0).normalize().dot(fwd) * 4;   // prefer what is in front
+    if (s < bs) { bs = s; best = tg; }
+  }
+  const finisher = combo % 5 === 4;
+  const anim = finisher ? 'uppercut' : ['punch1', 'punch2', 'punch3', 'kick'][combo % 5];
+  playOnce(anim, 0.4);
+  if (!best) return;
+  const dist = best.p.distanceTo(pos);
+  if (dist > 2.2) lunge = { tg: best, finisher }; else hit(best, finisher);
+}
+function hit(tg, finisher) {
+  const dir = tg.p.clone().sub(pos).setY(0).normalize();
+  player.rotation.y = Math.atan2(dir.x, dir.z);
+  if (tg.kind === 'thug') {
+    const t = tg.t; t.hp--; t.atk = 0;
+    if (t.hp <= 0 || finisher) {
+      t.down = 7; t.v.copy(dir).multiplyScalar(finisher ? 8 : 14); t.v.y = finisher ? 16 : 7;
+      t.an.play('thugKnockdown', { once: true, fade: 0.05 }); score++; say(`Bandido nocauteado! (${score})`);
+    } else {
+      t.stun = 0.6; t.v.copy(dir).multiplyScalar(4);
+      t.an.play(['thugStumbleBack', 'thugStumbleLeft', 'thugStumbleRight'][Math.floor(lr() * 3)], { once: true, fade: 0.05 });
+    }
+  } else {
+    net.send({ t: 'hit', to: tg.r.id, dir: [dir.x, finisher ? 1 : 0.3, dir.z] });
+  }
+}
+function takeHit(dir, dmg) {
+  if (invuln > 0 || downT > 0) return false;
+  hp -= dmg; hurtT = 4; anchor = null; zip = null; wall = null; lunge = null;
+  vel.set(dir[0] * 10, Math.max(4, dir[1] * 12), dir[2] * 10); onGround = false;
+  if (hp <= 0) { hp = 0; downT = 3; playOnce('knockdown', 3); say('Você foi nocauteado!'); }
+  else playOnce('hitReact', 0.35);
+  return true;
+}
+function dodge(wish) {
+  if (dodgeT > 0 || downT > 0) return;
+  const d = wish.lengthSq() ? wish.clone() : new THREE.Vector3(Math.sin(yaw), 0, Math.cos(yaw));
+  vel.x = d.x * 18; vel.z = d.z * 18; if (!onGround) vel.y = Math.max(vel.y, 3);
+  dodgeT = 0.6; invuln = 0.45; lunge = null;
+  const sideways = wish.lengthSq() && Math.abs(wish.dot(new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw)))) > 0.7;
+  playOnce(sideways ? 'dodgeSide' : 'dodge', 0.45);
+}
+
+// ---------- swinging ----------
+function findAnchor(dir) {
+  // like the original: attach ahead and above, on the nearest building edge along the path
+  const P = pos.clone().addScaledVector(dir, 24); P.y = pos.y + 26;
+  let best = null, bd = Infinity;
+  for (const b of nearBuildings(P.x, P.z)) {
+    const a = new THREE.Vector3(Math.max(b.x0, Math.min(b.x1, P.x)), Math.min(P.y, b.h), Math.max(b.z0, Math.min(b.z1, P.z)));
+    const d = a.distanceTo(P);
+    if (d < bd && a.y > pos.y + 5 && a.distanceTo(pos) < 70) { bd = d; best = a; }
+  }
+  return best;
+}
+function releaseWeb(boost) {
+  if (!anchor) return; anchor = null;
+  if (boost) {
+    const h = new THREE.Vector3(vel.x, 0, vel.z);
+    vel.addScaledVector(h, 0.15); vel.y = Math.max(vel.y, 0) + 9;
+    playOnce(['releaseFlip', 'releaseCorkscrew', 'releaseSpread', 'releaseTuck'][Math.floor(lr() * 4)], 0.9);
+  } else if (vel.y > 0) vel.y += 4;
+}
+
+// ---------- physics ----------
+const G = 30, fwd = new THREE.Vector3(), right = new THREE.Vector3(), wish = new THREE.Vector3(), camDir = new THREE.Vector3();
+function step(dt) {
+  fwd.set(-Math.sin(yaw), 0, -Math.cos(yaw)); right.set(-fwd.z, 0, fwd.x);
+  wish.set(0, 0, 0);
+  if (keys.KeyW) wish.add(fwd); if (keys.KeyS) wish.sub(fwd);
+  if (keys.KeyD) wish.add(right); if (keys.KeyA) wish.sub(right);
+  if (wish.lengthSq()) wish.normalize();
+  const sprint = keys.ShiftLeft || keys.ShiftRight;
+  const swingHeld = !!(mouse & 4) && downT <= 0;
+  const jumpHeld = keys.Space;
+
+  invuln -= dt; dodgeT -= dt; atkT -= dt; comboT -= dt; hurtT -= dt; oneShotT -= dt;
+  if (hurtT <= 0 && hp < 100 && downT <= 0) hp = Math.min(100, hp + 12 * dt);
+  if (downT > 0) { downT -= dt; if (downT <= 0) { hp = 100; invuln = 2; playOnce('getUp', 0.8); } }
+  const canAct = downT <= 0;
+
+  const atkP = took('M0') | took('KeyF'), dodgeP = took('KeyQ'), zipP = took('KeyE') | took('M1');
+  if (canAct && atkP) attack();
+  if (canAct && dodgeP) dodge(wish);
+  if (took('KeyT')) {
+    const list = [...remotes.values()].filter(r => r.obj && r.target);
+    if (list.length) {
+      tpIdx = (tpIdx + 1) % list.length; const r = list[tpIdx];
+      pos.copy(r.target.p).add(new THREE.Vector3(2, 1, 2)); vel.set(0, 0, 0);
+      anchor = null; zip = null; wall = null; lunge = null; onGround = false;
+      say(`Teleportado até ${r.name || 'jogador'}`);
+    } else say('Ninguém online para teleportar');
+  }
+
+  // zip to point (E / middle mouse): pull to the roof edge you aim at
+  if (canAct && zipP && !zip) {
+    camera.getWorldDirection(camDir);
+    const hitC = raycastCity(camera.position, camDir, 150);
+    if (hitC) {
+      const b = hitC.b, c = hitC.point;
+      const tx = Math.max(b.x0 + 0.8, Math.min(b.x1 - 0.8, c.x)), tz = Math.max(b.z0 + 0.8, Math.min(b.z1 - 0.8, c.z));
+      zip = { to: new THREE.Vector3(tx, b.h, tz), edge: new THREE.Vector3(Math.max(b.x0, Math.min(b.x1, c.x)), b.h, Math.max(b.z0, Math.min(b.z1, c.z))) };
+      anchor = null; wall = null; onGround = false; lunge = null;
+      playOnce('webZipPull', 0.25);
+    }
+  }
+
+  if (zip) {
+    const d = zip.edge.clone().add(new THREE.Vector3(0, 1.5, 0)).sub(pos), L = d.length();
+    if (L < 2.5) { pos.copy(zip.to); vel.set(0, 0, 0).addScaledVector(fwd, 3); zip = null; onGround = true; playOnce('perchLand', 0.5); }
+    else { vel.copy(d.divideScalar(L).multiplyScalar(48)); pos.addScaledVector(vel, dt); }
+    took('Space');
+    return;
+  }
+
+  // lunge toward the attack target
+  if (lunge) {
+    const d = lunge.tg.p.clone().sub(pos); d.y = 0; const L = d.length();
+    if (L < 1.8 || atkT < -0.4) { hit(lunge.tg, lunge.finisher); lunge = null; vel.set(0, vel.y, 0); }
+    else { d.divideScalar(L); vel.x = d.x * 28; vel.z = d.z * 28; player.rotation.y = Math.atan2(d.x, d.z); }
+  }
+
+  // web swing: hold right mouse
+  if (swingHeld && !anchor && !wall) {
+    if (onGround) { vel.y = 12; onGround = false; }            // swing from the ground: hop first
+    else if (airT > 0.1) {
+      const h = new THREE.Vector3(vel.x, 0, vel.z);
+      const dir = h.lengthSq() > 25 ? h.normalize() : (wish.lengthSq() ? wish.clone() : fwd.clone());
+      anchor = findAnchor(dir);
+      if (anchor) { ropeLen = Math.max(8, anchor.distanceTo(pos)); playOnce(lr() < 0.5 ? 'webShootR' : 'webShootL', 0.2); }
+    }
+  }
+  if (anchor && !swingHeld) releaseWeb(false);
+  if (anchor && took('Space')) releaseWeb(true);
+  if ((keys.KeyC || keys.ControlLeft) && !onGround && !wall) { anchor = null; vel.y = Math.min(vel.y, -28); }
+
+  // wall: stick, crawl, jump off, vault over the top
+  if (wall) {
+    const up = keys.KeyW ? 1 : keys.KeyS ? -1 : 0;
+    const side = new THREE.Vector3(-wall.n.z, 0, wall.n.x), strafe = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0);
+    const camRight = right.dot(side) >= 0 ? 1 : -1;
+    const sp = sprint ? 16 : 8;
+    vel.set(0, up * sp, 0).addScaledVector(side, strafe * camRight * 6).addScaledVector(wall.n, -2);
+    if (took('Space')) {
+      vel.copy(wall.n).multiplyScalar(12).addScaledVector(fwd, 4); vel.y = 13; wall = null; playOnce('wallJump', 0.5);
+    }
+  } else if (onGround) {
+    const speed = sprint ? 22 : 9;
+    if (!lunge && dodgeT <= 0.2) {
+      const k = Math.min(1, dt * 10), s = canAct ? speed : 0;
+      vel.x += (wish.x * s - vel.x) * k; vel.z += (wish.z * s - vel.z) * k;
+    }
+    if (jumpHeld && canAct) jumpCharge = Math.min(0.7, jumpCharge + dt);
+    else if (jumpCharge > 0) {
+      vel.y = 12 + jumpCharge * 22; onGround = false;
+      playOnce(jumpCharge > 0.35 ? 'jumpLaunchHigh' : 'jump', 0.5); jumpCharge = 0;
+    }
+  } else {
+    jumpCharge = 0;
+    vel.y -= G * dt;
+    if (anchor) {
+      // pump: pushing forward along the swing adds speed, like leaning into it
+      vel.addScaledVector(wish, 16 * dt);
+      const h = new THREE.Vector3(vel.x, 0, vel.z); if (h.lengthSq() > 1) vel.addScaledVector(h.normalize(), 5 * dt);
+    } else vel.addScaledVector(wish, 7 * dt);
+    const sp = vel.length(); if (sp > 60) vel.multiplyScalar(60 / sp);
+  }
+  took('Space');
+
+  const prevY = pos.y;
+  pos.addScaledVector(vel, dt);
+
+  if (anchor) {
+    ropeLen = Math.max(8, ropeLen - 3 * dt);
+    const d = pos.clone().sub(anchor), L = d.length();
+    if (L > ropeLen) {
+      d.divideScalar(L); pos.copy(anchor).addScaledVector(d, ropeLen);
+      const radial = vel.dot(d); if (radial > 0) vel.addScaledVector(d, -radial);
+    }
+    // swung past and above the anchor: let go automatically, keep the momentum
+    if (pos.y > anchor.y - 2 && vel.y > 0) releaseWeb(true);
+  }
+
+  // collisions with buildings
+  const wasGround = onGround;
+  onGround = false; let touch = null;
+  for (const b of nearBuildings(pos.x, pos.z)) {
+    const inX = pos.x > b.x0 - R && pos.x < b.x1 + R, inZ = pos.z > b.z0 - R && pos.z < b.z1 + R;
+    if (!inX || !inZ) continue;
+    if (pos.y >= b.h - 0.01) continue;
+    if (prevY >= b.h - 0.3) { pos.y = b.h; if (vel.y < 0) vel.y = 0; onGround = true; continue; }
+    const px = Math.min(pos.x - (b.x0 - R), b.x1 + R - pos.x), pz = Math.min(pos.z - (b.z0 - R), b.z1 + R - pos.z);
+    const n = new THREE.Vector3();
+    if (px < pz) { const l = pos.x - b.x0 < b.x1 - pos.x; pos.x = l ? b.x0 - R : b.x1 + R; n.set(l ? -1 : 1, 0, 0); vel.x = 0; }
+    else { const l = pos.z - b.z0 < b.z1 - pos.z; pos.z = l ? b.z0 - R : b.z1 + R; n.set(0, 0, l ? -1 : 1); vel.z = 0; }
+    touch = { b, n };
+  }
+  if (!onGround) for (const b of nearBuildings(pos.x, pos.z))
+    if (pos.x > b.x0 - R && pos.x < b.x1 + R && pos.z > b.z0 - R && pos.z < b.z1 + R && Math.abs(pos.y - b.h) < 0.02 && vel.y <= 0) onGround = true;
+  if (pos.y <= 0) { pos.y = 0; if (vel.y < 0) vel.y = 0; onGround = true; }
+
+  if (wall) {
+    if (touch) wall = touch;
+    else if (pos.y >= wall.b.h - 1.2) { vel.copy(wall.n).multiplyScalar(-5); vel.y = 8; wall = null; playOnce('wallToRoofVault', 0.5); }
+    else wall = null;
+    if (wall && onGround && !keys.KeyW) wall = null;                  // crawled down to the street
+  } else if (touch && canAct && (!onGround || wish.dot(touch.n) < -0.5)) {
+    wall = touch; anchor = null; onGround = false; lunge = null;       // stick to it
+  }
+  if (!wasGround && onGround && airT > 0.6 && !(oneShot && oneShotT > 0)) playOnce(airT > 1.8 ? 'landHard' : 'landLight', airT > 1.8 ? 0.45 : 0.25);
+  pos.x = Math.max(-HALF - 150, Math.min(HALF + 150, pos.x));
+  pos.z = Math.max(-HALF - 150, Math.min(HALF + 150, pos.z));
+  airT = onGround || wall ? 0 : airT + dt;
+}
+
+// ---------- thug AI ----------
+function stepThugs(dt) {
+  for (const t of thugs) {
+    const m = t.m;
+    if (t.down > 0) {
+      t.down -= dt; t.v.y -= G * dt; m.position.addScaledVector(t.v, dt);
+      if (m.position.y < 0) { m.position.y = 0; t.v.set(0, 0, 0); }
+      if (t.down <= 0) { placeThug(t); t.an.play('thugIdle'); }
+      continue;
+    }
+    if (t.stun > 0) { t.stun -= dt; m.position.addScaledVector(t.v, dt); t.v.multiplyScalar(0.9); continue; }
+    const dx = pos.x - m.position.x, dz = pos.z - m.position.z, d = Math.hypot(dx, dz);
+    const aggro = (locked || BOT) && d < 16 && Math.abs(pos.y - m.position.y) < 3 && downT <= 0;
+    t.cd -= dt;
+    if (t.atk > 0) {                                  // mid-swing: the hit lands 0.45 s in
+      const before = t.atk; t.atk -= dt;
+      if (before > 0.35 && t.atk <= 0.35 && d < 2.3) takeHit([dx / (d || 1), 0.3, dz / (d || 1)], 12);
+      if (t.atk <= 0) t.an.play('thugIdle');
+      continue;
+    }
+    if (aggro) {
+      m.rotation.y = Math.atan2(dx, dz);
+      if (d > 1.8) {
+        const sp = d > 6 ? 5 : 2.5, nx = m.position.x + dx / d * sp * dt, nz = m.position.z + dz / d * sp * dt;
+        if (!blocked(nx, nz, 0.5)) m.position.set(nx, 0, nz);
+        t.an.play(d > 6 ? 'jog' : 'walk');
+      } else if (t.cd <= 0) {
+        t.atk = 0.8; t.cd = 1.6 + lr() * 1.4;
+        t.an.play(['thugPunch1', 'thugPunch2', 'thugKick'][Math.floor(lr() * 3)], { once: true, fade: 0.08 });
+      } else t.an.play('thugIdle');
+    } else {
+      const hx = t.home.x - m.position.x, hz = t.home.z - m.position.z, hd = Math.hypot(hx, hz);
+      if (hd > 1) { m.rotation.y = Math.atan2(hx, hz); m.position.x += hx / hd * 2 * dt; m.position.z += hz / hd * 2 * dt; t.an.play('walk'); }
+      else t.an.play('thugIdle');
+    }
+  }
+}
+
+// ---------- multiplayer ----------
+const remotes = new Map();   // id -> {id, name, color, obj, an, target:{p,r}, web, anim, label}
+function label(text) {
+  const c = document.createElement('canvas'); c.width = 256; c.height = 48;
+  const g = c.getContext('2d'); g.font = 'bold 26px system-ui'; g.textAlign = 'center';
+  g.fillStyle = 'rgba(0,0,0,.55)'; const w = Math.min(250, g.measureText(text).width + 24); g.fillRect(128 - w / 2, 4, w, 40);
+  g.fillStyle = '#fff'; g.fillText(text, 128, 34);
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), depthTest: false, transparent: true, fog: false, sizeAttenuation: false }));
+  s.scale.set(0.16, 0.03, 1); s.position.y = 2.4; s.renderOrder = 10; return s;
+}
+function tint(r) { r.obj?.traverse(x => { if (x.isMesh) x.material.color.setHex(SUITS[r.color % SUITS.length]); }); }
+function buildRemote(r) {
+  if (r.obj || !spiderSrc) return;
+  const o = SkeletonUtils.clone(spiderSrc);
+  o.traverse(x => { if (x.isMesh) x.material = x.material.clone(); });
+  const g = new THREE.Group(); g.add(o); r.label = label(r.name); g.add(r.label);
+  r.obj = g; r.an = animator(o, spiderClips); r.an.play('idle'); r.web = makeWeb();
+  if (r.target) g.position.copy(r.target.p);
+  scene.add(g); tint(r);
+}
+function remote(id) {
+  let r = remotes.get(id);
+  if (!r) { r = { id, name: '', color: id }; remotes.set(id, r); buildRemote(r); }
+  return r;
+}
+function dropRemote(id) {
+  const r = remotes.get(id); if (!r) return;
+  if (r.obj) scene.remove(r.obj); if (r.web) scene.remove(r.web);
+  remotes.delete(id);
+}
+const ONCE = /^(punch|kick|uppercut|dodge|land|release|hitReact|knockdown|getUp|jump|perch|wallJump|wallToRoof|webShoot|webZip)/;
+const net = {
+  ws: null, id: 0, t: 0,
+  connect(name) {
+    const url = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+    let ws; try { ws = new WebSocket(url); } catch { return; }
+    this.ws = ws;
+    ws.onopen = () => { ws.send(JSON.stringify({ t: 'hello', name })); say('Conectado ao servidor'); };
+    ws.onclose = () => {
+      if (this.ws !== ws) return; this.ws = null;
+      for (const id of [...remotes.keys()]) dropRemote(id);
+      say('Sem servidor multiplayer (modo solo). Tentando de novo...');
+      setTimeout(() => this.connect(name), 5000);
+    };
+    ws.onmessage = e => {
+      let m; try { m = JSON.parse(e.data); } catch { return; }
+      if (m.t === 'welcome') this.id = m.id;
+      else if (m.t === 'name') {
+        const r = remote(m.id); r.color = m.color;
+        if (r.name !== m.name) {
+          r.name = m.name; say(`${m.name} está no mundo`);
+          if (r.obj) { r.obj.remove(r.label); r.label = label(m.name); r.obj.add(r.label); }
+        }
+        tint(r);
+      } else if (m.t === 's') {
+        const r = remote(m.id);
+        r.target = { p: new THREE.Vector3().fromArray(m.p), r: m.r };
+        r.anim = m.a; r.webTo = m.w ? new THREE.Vector3().fromArray(m.w) : null; r.down = !!m.d;
+        if (r.obj && !r.seen) { r.obj.position.copy(r.target.p); r.seen = true; }
+      } else if (m.t === 'bye') {
+        const r = remotes.get(m.id); if (r) say(`${r.name || 'Alguém'} saiu`); dropRemote(m.id);
+      } else if (m.t === 'hit') {
+        const r = remotes.get(m.from);
+        if (takeHit(m.dir, 15) && downT > 0 && r) say(`${r.name} te nocauteou!`);
+      }
+    };
+  },
+  send(obj) { if (this.ws?.readyState === 1) this.ws.send(JSON.stringify(obj)); },
+  tick(dt) {
+    this.t -= dt; if (this.t > 0 || this.ws?.readyState !== 1) return; this.t = 1 / 20;
+    const r2 = v => Math.round(v * 100) / 100;
+    const w = zip ? zip.edge : anchor;
+    this.send({ t: 's', p: [r2(pos.x), r2(pos.y), r2(pos.z)], r: r2(player.rotation.y), a: pAnim?.name || 'idle', w: w ? [r2(w.x), r2(w.y), r2(w.z)] : null, d: downT > 0 ? 1 : 0 });
+  },
+};
+function stepRemotes(dt) {
+  const k = 1 - Math.exp(-dt * 15);
+  for (const r of remotes.values()) {
+    if (!r.obj || !r.target) continue;
+    r.obj.position.lerp(r.target.p, k);
+    let dr = r.target.r - r.obj.rotation.y; dr = Math.atan2(Math.sin(dr), Math.cos(dr));
+    r.obj.rotation.y += dr * k;
+    if (r.anim && r.an.name !== r.anim) r.an.play(r.anim, { once: ONCE.test(r.anim) });
+    if (r.obj.position.distanceToSquared(pos) < 150 * 150) r.an.mixer.update(dt);
+    setWeb(r.web, r.obj.position.clone().setY(r.obj.position.y + 1.5), r.webTo);
+  }
+}
+
+// ---------- loop ----------
+const camPos = new THREE.Vector3(), look = new THREE.Vector3(), handPos = new THREE.Vector3();
+const clock = new THREE.Clock();
+let fpsN = 0, fpsT = 0, fps = 0;
+function animatePlayer() {
+  if (!pAnim || downT > 0) return;
+  if (oneShot && oneShotT > 0) return;
+  oneShot = null;
+  const hs = Math.hypot(vel.x, vel.z);
+  let a;
+  if (zip) a = 'zipFlight';
+  else if (anchor) { const dy = anchor.y - pos.y; a = dy > ropeLen * 0.85 ? 'swingBottom' : vel.y > 4 ? 'swingHigh' : 'swing'; }
+  else if (wall) a = Math.abs(vel.y) > 10 ? 'wallRun' : Math.abs(vel.y) > 0.5 || Math.hypot(vel.x, vel.z) > 3 ? 'wallCrawl' : 'wallIdle';
+  else if (!onGround && airT > 0.08) a = vel.y > 3 ? 'airRise' : vel.y > -6 ? 'airApex' : vel.y < -22 ? 'fallFast' : 'fall';
+  else if (jumpCharge > 0.1) a = 'jumpCrouch';
+  else if (hs < 0.8) a = 'idle';
+  else if (hs < 5) a = 'walk';
+  else if (hs < 14) a = 'run';
+  else a = 'sprint';
+  pAnim.play(a);
+}
+function frame() {
+  if (BOT) setTimeout(frame, 16); else requestAnimationFrame(frame);
+  const dt = Math.min(clock.getDelta(), 1 / 30);
+  if (locked || BOT) step(dt);
+  stepThugs(dt);
+  stepRemotes(dt);
+  net.tick(dt);
+
+  player.position.copy(pos);
+  const hs = Math.hypot(vel.x, vel.z);
+  if (wall) player.rotation.y = Math.atan2(-wall.n.x, -wall.n.z);
+  else if (zip) player.rotation.y = Math.atan2(vel.x, vel.z);
+  else if (hs > 0.5 && !lunge && atkT <= 0) {
+    let dr = Math.atan2(vel.x, vel.z) - player.rotation.y; dr = Math.atan2(Math.sin(dr), Math.cos(dr));
+    player.rotation.y += dr * Math.min(1, dt * 14);
+  }
+  animatePlayer();
+  pAnim?.mixer.update(dt);
+  for (const t of thugs) if (t.m.position.distanceToSquared(pos) < 120 * 120) t.an.mixer.update(dt);
+
+  if (handR) handR.getWorldPosition(handPos); else handPos.copy(pos).setY(pos.y + 1.6);
+  setWeb(web, handPos, zip ? zip.edge : anchor);
+
+  const dist = anchor || zip ? 8.5 : 6.5;
+  camPos.set(pos.x + Math.sin(yaw) * Math.cos(pitch) * dist, pos.y + 1.8 + Math.sin(pitch) * dist, pos.z + Math.cos(yaw) * Math.cos(pitch) * dist);
+  camPos.y = Math.max(0.5, camPos.y);
+  camera.position.lerp(camPos, 1 - Math.exp(-dt * 12));
+  look.set(pos.x, pos.y + 1.5, pos.z); camera.lookAt(look);
+  const fov = 65 + Math.min(22, vel.length() * 0.4);
+  if (Math.abs(camera.fov - fov) > 0.2) { camera.fov += (fov - camera.fov) * 0.1; camera.updateProjectionMatrix(); }
+
+  renderer.render(scene, camera);
+
+  fpsN++; fpsT += dt; if (fpsT > 0.5) { fps = Math.round(fpsN / fpsT); fpsN = 0; fpsT = 0; }
+  hpBar.style.width = hp + '%';
+  const online = net.ws?.readyState === 1 ? `${remotes.size + 1} online` : 'solo';
+  let who = '';
+  for (const r of remotes.values()) if (r.obj) who += `\n  ${r.name || 'jogador'}: ${Math.round(r.obj.position.distanceTo(pos))} m`;
+  hud.textContent = `FPS ${fps}  |  ${online}  |  Nocautes: ${score}\nVel: ${Math.round(vel.length() * 3.6)} km/h  |  Altura: ${Math.round(pos.y)} m` +
+    (remotes.size ? `\nJogadores (T = teleportar):${who}` : '');
+}
+frame();
+</script>
+</body>
+</html>

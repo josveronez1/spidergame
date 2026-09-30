@@ -1,0 +1,14 @@
+{
+  "name": "spiderbench-server",
+  "version": "1.0.0",
+  "description": "Spiderbench Lite: static files + multiplayer relay",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "type": "commonjs",
+  "dependencies": {
+    "ws": "^8.22.0"
+  },
+  "private": true
+}
